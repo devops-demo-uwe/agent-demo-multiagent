@@ -1,7 +1,11 @@
 ﻿using Azure.AI.Projects;
+using Azure.AI.Extensions.OpenAI;
 using Azure.Core;
 using Azure.Identity;
 using Microsoft.Extensions.Configuration;
+using OpenAI.Responses;
+
+#pragma warning disable OPENAI001
 
 // MultiAgentTeachingDemo
 // ----------------------
@@ -9,10 +13,9 @@ using Microsoft.Extensions.Configuration;
 // one request is passed through several focused agents, and each agent adds a
 // small piece of useful work to shared memory.
 //
-// The agents themselves stay deterministic so the teaching flow is easy to
-// explain. The app also shows how to connect to an Azure AI Foundry project with
-// Azure CLI sign-in. That keeps the important configuration and authentication
-// lesson visible without requiring a live model call for the demo to run.
+// This version intentionally uses live Azure AI Foundry model calls. That means
+// the output is no longer deterministic, but the agent responsibilities remain
+// small and visible: clarify the request, explore options, then recommend a plan.
 
 UserRequest request = new(
 	Audience: "software team lead",
@@ -20,18 +23,6 @@ UserRequest request = new(
 	Constraint: "Keep the first experiment lightweight and easy to reverse.");
 
 FoundryConnectionContext foundryConnection = FoundryConnectionContext.Load();
-
-// The coordinator owns the workflow. The agents own the specialized decisions.
-// This separation is the main teaching point: orchestration and expertise are
-// different responsibilities.
-MultiAgentCoordinator coordinator = new(new IAgent[]
-{
-	new IntakeAgent(),
-	new OptionsAgent(),
-	new RecommendationAgent()
-});
-
-AgentWorkingMemory finalMemory = coordinator.Run(request, foundryConnection);
 
 Console.WriteLine("Multi-agent teaching demo");
 Console.WriteLine("=========================");
@@ -43,6 +34,34 @@ Console.WriteLine("Foundry connection");
 Console.WriteLine("------------------");
 Console.WriteLine(foundryConnection.StatusMessage);
 Console.WriteLine();
+
+if (!foundryConnection.IsReady)
+{
+	return;
+}
+
+// The coordinator owns the workflow. The agents own the specialized decisions.
+// This separation is the main teaching point: orchestration and expertise are
+// different responsibilities.
+MultiAgentCoordinator coordinator = new(new IAgent[]
+{
+	new IntakeAgent(),
+	new OptionsAgent(),
+	new RecommendationAgent()
+});
+
+AgentWorkingMemory finalMemory;
+
+try
+{
+	finalMemory = await coordinator.RunAsync(request, foundryConnection);
+}
+catch (Exception exception) when (exception is not OperationCanceledException)
+{
+	Console.WriteLine("A live Foundry model call failed.");
+	Console.WriteLine(exception.Message);
+	return;
+}
 
 // Printing each turn makes the collaboration visible. This is useful when
 // teaching because learners can see the input, the agent role, and the final
@@ -75,6 +94,7 @@ public sealed record AgentTurn(string AgentName, string Goal, string Message);
 public sealed record FoundryConnectionContext(
 	string? ProjectUrl,
 	string? ModelDeploymentName,
+	ProjectResponsesClient? ResponsesClient,
 	bool HasProjectUrl,
 	bool HasModelDeploymentName,
 	bool IsAuthenticated,
@@ -85,6 +105,29 @@ public sealed record FoundryConnectionContext(
 	private const string FoundryTokenScope = "https://ai.azure.com/.default";
 
 	public bool IsReady => HasProjectUrl && HasModelDeploymentName && IsAuthenticated;
+
+	public async Task<string> AskModelAsync(
+		string instructions,
+		string input,
+		CancellationToken cancellationToken = default)
+	{
+		if (ResponsesClient is null)
+		{
+			throw new InvalidOperationException("Foundry is not ready. Configure the project URL, model deployment name, and Azure CLI sign-in before running the agents.");
+		}
+
+		// Each teaching agent gets its own instruction block. The user's request
+		// and previous agent turns are supplied as input so the model can build on
+		// the shared working memory.
+		CreateResponseOptions options = new()
+		{
+			Instructions = instructions
+		};
+		options.InputItems.Add(ResponseItem.CreateUserMessageItem(input));
+
+		var response = await ResponsesClient.CreateResponseAsync(options, cancellationToken);
+		return response.Value.GetOutputText() ?? string.Empty;
+	}
 
 	public static FoundryConnectionContext Load()
 	{
@@ -101,6 +144,7 @@ public sealed record FoundryConnectionContext(
 			return new FoundryConnectionContext(
 				ProjectUrl: projectUrl,
 				ModelDeploymentName: modelDeploymentName,
+				ResponsesClient: null,
 				HasProjectUrl: !string.IsNullOrWhiteSpace(projectUrl),
 				HasModelDeploymentName: !string.IsNullOrWhiteSpace(modelDeploymentName),
 				IsAuthenticated: false,
@@ -116,6 +160,7 @@ public sealed record FoundryConnectionContext(
 			return new FoundryConnectionContext(
 				ProjectUrl: projectUrl,
 				ModelDeploymentName: modelDeploymentName,
+				ResponsesClient: null,
 				HasProjectUrl: true,
 				HasModelDeploymentName: true,
 				IsAuthenticated: false,
@@ -130,10 +175,11 @@ public sealed record FoundryConnectionContext(
 			// local development authentication path explicit for a teaching sample.
 			AzureCliCredential credential = new();
 			AIProjectClient projectClient = new(projectUri, credential);
+			ProjectResponsesClient responsesClient = projectClient.ProjectOpenAIClient.GetProjectResponsesClientForModel(modelDeploymentName);
 
-			// Constructing the client proves the SDK can be configured. Requesting a
-			// token proves the local Azure CLI identity is usable without printing or
-			// storing the token. The agents remain deterministic and do not call a model.
+			// Requesting a token proves the local Azure CLI identity is usable without
+			// printing or storing the token. The agent turns below will make the live
+			// model calls through the ProjectResponsesClient.
 			AccessToken accessToken = credential.GetToken(
 				new TokenRequestContext(new[] { FoundryTokenScope }),
 				CancellationToken.None);
@@ -141,13 +187,14 @@ public sealed record FoundryConnectionContext(
 			return new FoundryConnectionContext(
 				ProjectUrl: projectUrl,
 				ModelDeploymentName: modelDeploymentName,
+				ResponsesClient: responsesClient,
 				HasProjectUrl: true,
 				HasModelDeploymentName: true,
 				IsAuthenticated: true,
 				StatusMessage:
 					$"Created {projectClient.GetType().Name} for {projectUri} using model deployment '{modelDeploymentName}'. " +
 					$"Azure CLI authentication succeeded with a token that expires at {accessToken.ExpiresOn:u}. " +
-					"This demo stops before calling a model so the three-agent teaching flow stays deterministic.");
+					"Live Foundry model calls are enabled for the three teaching agents.");
 		}
 		catch (CredentialUnavailableException exception)
 		{
@@ -168,6 +215,7 @@ public sealed record FoundryConnectionContext(
 		return new FoundryConnectionContext(
 			ProjectUrl: projectUrl,
 			ModelDeploymentName: modelDeploymentName,
+			ResponsesClient: null,
 			HasProjectUrl: true,
 			HasModelDeploymentName: true,
 			IsAuthenticated: false,
@@ -190,6 +238,18 @@ public sealed record AgentWorkingMemory(
 {
 	public string LastMessage => Turns.Count == 0 ? string.Empty : Turns[^1].Message;
 
+	public string DescribePriorTurns()
+	{
+		if (Turns.Count == 0)
+		{
+			return "No prior agent turns yet.";
+		}
+
+		return string.Join(
+			Environment.NewLine + Environment.NewLine,
+			Turns.Select(turn => $"[{turn.AgentName}] {turn.Message}"));
+	}
+
 	public AgentWorkingMemory Add(AgentTurn turn)
 	{
 		List<AgentTurn> updatedTurns = new(Turns)
@@ -202,16 +262,15 @@ public sealed record AgentWorkingMemory(
 }
 
 // All agents implement the same tiny contract. A larger system might make this
-// asynchronous, include cancellation tokens, add structured inputs and outputs,
-// or expose telemetry. The teaching version uses one method so the pattern is
-// easy to read from top to bottom.
+// include more structured inputs and outputs, or expose telemetry. This version
+// is asynchronous because every agent asks Foundry to do its specialized work.
 public interface IAgent
 {
 	string Name { get; }
 
 	string Goal { get; }
 
-	AgentTurn Respond(AgentWorkingMemory memory);
+	Task<AgentTurn> RespondAsync(AgentWorkingMemory memory, CancellationToken cancellationToken = default);
 }
 
 // The coordinator is intentionally boring. It does not contain the domain logic.
@@ -226,13 +285,16 @@ public sealed class MultiAgentCoordinator
 		this.agents = agents;
 	}
 
-	public AgentWorkingMemory Run(UserRequest request, FoundryConnectionContext foundryConnection)
+	public async Task<AgentWorkingMemory> RunAsync(
+		UserRequest request,
+		FoundryConnectionContext foundryConnection,
+		CancellationToken cancellationToken = default)
 	{
 		AgentWorkingMemory memory = new(request, foundryConnection, Array.Empty<AgentTurn>());
 
 		foreach (IAgent agent in agents)
 		{
-			AgentTurn turn = agent.Respond(memory);
+			AgentTurn turn = await agent.RespondAsync(memory, cancellationToken);
 			memory = memory.Add(turn);
 		}
 
@@ -251,18 +313,20 @@ public sealed class IntakeAgent : IAgent
 
 	public string Goal => "Clarify the request and name the success criteria.";
 
-	public AgentTurn Respond(AgentWorkingMemory memory)
+	public async Task<AgentTurn> RespondAsync(AgentWorkingMemory memory, CancellationToken cancellationToken = default)
 	{
 		UserRequest request = memory.Request;
-		string foundryNote = memory.FoundryConnection.IsReady
-			? $"The app is also authenticated to the configured Foundry project and has model deployment '{memory.FoundryConnection.ModelDeploymentName}', so a later lesson could replace one deterministic agent with a model-backed agent."
-			: "The app can still run the deterministic teaching workflow while Foundry configuration or Azure CLI sign-in is completed.";
+		string instructions =
+			"You are the Intake Agent in a three-agent teaching demo. " +
+			"Clarify the user's request, identify the main constraint, and define what success should mean. " +
+			"Do not propose solutions yet. Keep the response to 3 or 4 concise sentences.";
 
-		string message =
-			$"The {request.Audience} wants guidance on: '{request.Question}' " +
-			$"The plan should honor this constraint: {request.Constraint} " +
-			"Success means the team can try the habit without creating a large process. " +
-			foundryNote;
+		string input =
+			$"Audience: {request.Audience}\n" +
+			$"Question: {request.Question}\n" +
+			$"Constraint: {request.Constraint}";
+
+		string message = await memory.FoundryConnection.AskModelAsync(instructions, input, cancellationToken);
 
 		return new AgentTurn(Name, Goal, message);
 	}
@@ -270,28 +334,30 @@ public sealed class IntakeAgent : IAgent
 
 // Agent 2: OptionsAgent
 // ---------------------
-// The options agent proposes a few candidate actions. In a real app, this agent
-// might search documents, compare policies, or call tools. Here it uses simple
-// deterministic text so the example can run anywhere.
+// The options agent proposes a few candidate actions. It uses the live Foundry
+// model, but its instruction block keeps the agent focused on option generation
+// rather than final decision making.
 public sealed class OptionsAgent : IAgent
 {
 	public string Name => "Options Agent";
 
 	public string Goal => "Create a small set of practical choices.";
 
-	public AgentTurn Respond(AgentWorkingMemory memory)
+	public async Task<AgentTurn> RespondAsync(AgentWorkingMemory memory, CancellationToken cancellationToken = default)
 	{
-		string configurationOption = memory.FoundryConnection.HasProjectUrl && memory.FoundryConnection.HasModelDeploymentName
-			? "The Foundry project URL and model deployment name are configured outside source control."
-			: "The Foundry project URL and model deployment name still need to be supplied through user secrets or same-named environment variables.";
+		UserRequest request = memory.Request;
+		string instructions =
+			"You are the Options Agent in a three-agent teaching demo. " +
+			"Use the intake agent's clarification to create three practical options. " +
+			"For each option, include one short tradeoff. Do not make the final recommendation. " +
+			"Keep the response compact and easy to read in a console app.";
 
-		string message =
-			"Three lightweight options are available: " +
-			"1. run a two-week opt-in pilot, " +
-			"2. pair only on risky work, or " +
-			"3. schedule one shared problem-solving hour each day. " +
-			"The third option best matches the user's one-hour habit request. " +
-			configurationOption;
+		string input =
+			$"Original question: {request.Question}\n" +
+			$"Constraint: {request.Constraint}\n\n" +
+			$"Prior agent turns:\n{memory.DescribePriorTurns()}";
+
+		string message = await memory.FoundryConnection.AskModelAsync(instructions, input, cancellationToken);
 
 		return new AgentTurn(Name, Goal, message);
 	}
@@ -309,20 +375,21 @@ public sealed class RecommendationAgent : IAgent
 
 	public string Goal => "Choose one path and describe the next step.";
 
-	public AgentTurn Respond(AgentWorkingMemory memory)
+	public async Task<AgentTurn> RespondAsync(AgentWorkingMemory memory, CancellationToken cancellationToken = default)
 	{
-		string optionsSummary = memory.LastMessage;
-		string selectedOption = optionsSummary.Contains("third option", StringComparison.OrdinalIgnoreCase)
-			? "the third option from the prior agent"
-			: "the strongest option from the prior agent";
+		UserRequest request = memory.Request;
+		string instructions =
+			"You are the Recommendation Agent in a three-agent teaching demo. " +
+			"Read the prior agent turns, choose one path, and produce the final recommendation. " +
+			"Respect the user's constraint that the experiment must stay lightweight and easy to reverse. " +
+			"Include a short first step and a short review checkpoint. Keep the response under 180 words.";
 
-		string message =
-			$"Recommendation: use {selectedOption}: run a two-week experiment with one daily shared " +
-			"problem-solving hour. Ask for volunteers, rotate pairs, and capture " +
-			"one sentence of feedback after each session. At the end, keep, tune, " +
-			"or stop the habit based on whether the team reports better knowledge " +
-			"sharing without slower delivery. " +
-			"This keeps the three agent aspects clear: frame the problem, design options, then recommend a next step.";
+		string input =
+			$"Original question: {request.Question}\n" +
+			$"Constraint: {request.Constraint}\n\n" +
+			$"Prior agent turns:\n{memory.DescribePriorTurns()}";
+
+		string message = await memory.FoundryConnection.AskModelAsync(instructions, input, cancellationToken);
 
 		return new AgentTurn(Name, Goal, message);
 	}
