@@ -104,9 +104,10 @@ You can find this URL in the Microsoft Foundry portal for your project. Look in 
 
 ### Store Required Values With .NET User Secrets
 
-Use these commands from the repository root:
+User secrets belong to the project, so run these commands from the project folder:
 
 ```powershell
+cd MultiAgentTeachingDemo
 dotnet user-secrets set "AZURE_AI_FOUNDRY_PROJECT_URL" "https://<your-resource>.services.ai.azure.com/api/projects/<your-project>"
 dotnet user-secrets set "MODEL_DEPLOYMENT_NAME" "<your-model-deployment-name>"
 az login
@@ -152,10 +153,14 @@ The three teaching agents all use the same model deployment, but they do not use
 |-- .github/
 |   `-- copilot-instructions.md
 |-- .gitignore
-|-- MultiAgentTeachingDemo.csproj
-|-- Program.cs
+|-- MultiAgentTeachingDemo.slnx
+|-- MultiAgentTeachingDemo/
+|   |-- MultiAgentTeachingDemo.csproj
+|   `-- Program.cs
 `-- README.md
 ```
+
+The repository uses a solution file (`MultiAgentTeachingDemo.slnx`) at the root, with the project kept in its own `MultiAgentTeachingDemo/` folder. This mirrors a typical .NET layout where a solution groups one or more projects.
 
 The main demo is intentionally contained in `Program.cs`. For a larger application, these classes would normally move into separate files and possibly separate projects. Keeping them together makes the teaching flow easier to read from top to bottom.
 
@@ -173,7 +178,7 @@ The project targets `net8.0` and pins `<LangVersion>10.0</LangVersion>` so the c
 From the repository root, run:
 
 ```powershell
-dotnet run
+dotnet run --project MultiAgentTeachingDemo
 ```
 
 Expected output will show:
@@ -458,8 +463,10 @@ This gives you a simple but real teaching example: one user request, three role-
 
 ## Build The Demo
 
+From the repository root, build the solution:
+
 ```powershell
-dotnet build
+dotnet build MultiAgentTeachingDemo.slnx
 ```
 
 ## How The Code Works
@@ -578,9 +585,10 @@ dotnet --list-sdks
 
 If no SDK is installed, install the .NET SDK and retry the build.
 
-If the Foundry connection reports that setup is incomplete, set the required values with:
+If the Foundry connection reports that setup is incomplete, set the required values from the project folder with:
 
 ```powershell
+cd MultiAgentTeachingDemo
 dotnet user-secrets set "AZURE_AI_FOUNDRY_PROJECT_URL" "https://<your-resource>.services.ai.azure.com/api/projects/<your-project>"
 dotnet user-secrets set "MODEL_DEPLOYMENT_NAME" "<your-model-deployment-name>"
 az login
@@ -595,4 +603,4 @@ az account show
 
 Also confirm that your signed-in identity has access to the Foundry project.
 
-If the project builds but the output differs from the README, inspect `Program.cs` to see whether the scenario or agent messages were changed.
+If the project builds but the output differs from the README, inspect `MultiAgentTeachingDemo/Program.cs` to see whether the scenario or agent messages were changed.
